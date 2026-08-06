@@ -27,6 +27,7 @@ LLM API (embeddings + metadata extraction)
 | Type | Purpose |
 |------|---------|
 | **Agent** | A person, team, org, or AI that acts with intent |
+| **System** | A technical system — service, pipeline, datastore, host, or device (an `Agent` sub-label) |
 | **Need** | A gap, requirement, or want — has a lifecycle |
 | **Resource** | A capability or asset — skill, knowledge, tool, budget |
 | **Constraint** | A governing force — priority, understanding, approach, mechanics |
@@ -39,7 +40,7 @@ LLM API (embeddings + metadata extraction)
 
 ### Relationship Types
 
-23 typed relationships including `PURPOSE`, `CONTAINS`, `FILLS`, `GOVERNS`, `OWNS`, `SERVES`, `SIGNALS`, `SCOPED_TO`, `TRIGGERED_BY`, `AFFECTS`, `GOVERNED_BY`, and more. See `src/types.ts` for the full list.
+26 typed relationships including `PURPOSE`, `CONTAINS`, `FILLS`, `GOVERNS`, `OWNS`, `SERVES`, `SIGNALS`, `SCOPED_TO`, `TRIGGERED_BY`, `AFFECTS`, `GOVERNED_BY`, `DEPENDS_ON`, `FLOWS_TO`, `RUNS_ON`, and more. See `src/types.ts` for the full list.
 
 ## The Structured-Intent Model
 
@@ -388,7 +389,7 @@ Unified intake — send any content and it gets classified, embedded, and stored
 
 ### `create_entity`
 
-Create a typed entity node (Agent, Need, Resource, Constraint, Output, Role). Auto-generates embedding and extracts metadata via LLM. Explicit properties override LLM-extracted values.
+Create a typed entity node (Agent, System, Need, Resource, Constraint, Output, Role). Auto-generates embedding and extracts metadata via LLM. Explicit properties override LLM-extracted values.
 
 **Parameters:**
 
@@ -461,7 +462,7 @@ Start a session with participants, scope, and triggers. Creates `PARTICIPATES_IN
 
 ### `create_relationship`
 
-Create any of the 23 relationship types between two nodes with optional edge properties.
+Create any of the 26 relationship types between two nodes with optional edge properties.
 
 **Parameters:**
 
@@ -469,7 +470,7 @@ Create any of the 23 relationship types between two nodes with optional edge pro
 |------|------|----------|-------------|
 | `from_id` | string | Yes | Source node ID |
 | `to_id` | string | Yes | Target node ID |
-| `relationship_type` | string | Yes | One of: `PURPOSE`, `CONTAINS`, `FILLS`, `GOVERNS`, `OWNS`, `SERVES`, `GENERATED_BY`, `REQUIRES`, `PRODUCES`, `EVALUATED_AGAINST`, `HAS_STOCK`, `SIGNALS`, `OBSERVED_BY`, `FLAGGED_AT`, `PRODUCED_IN`, `PARTICIPATES_IN`, `SCOPED_TO`, `TRIGGERED_BY`, `DEFINED_BY`, `ESCALATED_TO`, `RELATED_TO` |
+| `relationship_type` | string | Yes | One of: `PURPOSE`, `CONTAINS`, `FILLS`, `GOVERNS`, `OWNS`, `SERVES`, `GENERATED_BY`, `REQUIRES`, `PRODUCES`, `EVALUATED_AGAINST`, `HAS_STOCK`, `SIGNALS`, `OBSERVED_BY`, `FLAGGED_AT`, `PRODUCED_IN`, `PARTICIPATES_IN`, `SCOPED_TO`, `TRIGGERED_BY`, `DEFINED_BY`, `ESCALATED_TO`, `RELATED_TO`, `AFFECTS`, `GOVERNED_BY`, `DEPENDS_ON`, `FLOWS_TO`, `RUNS_ON` |
 | `properties` | object | No | Edge properties |
 
 ```json

@@ -15,6 +15,7 @@ import {
   getNodeQuery,
   traverseQuery,
   createRelationshipQuery,
+  deleteRelationshipQuery,
   diagnosticQueries,
   captureQuery,
   updateNodeQuery,
@@ -22,7 +23,12 @@ import {
   listQuery,
   statsQueries,
   batchCreateRelationshipsQuery,
+  buildProcessingSummary,
+  KNOWN_SIGNAL_DISPOSITIONS,
+  KNOWN_SIGNAL_STATUSES,
   processingSummaryQuery,
+  sanitizeSignalVocabulary,
+  validateSignalVocabulary,
 } from "./queries.ts";
 import {
   ENTITY_LABELS,
@@ -31,17 +37,27 @@ import {
 } from "./types.ts";
 import type { NodeLabel, CypherQuery } from "./types.ts";
 
-/** Log full error to stderr and return a sanitized message for MCP clients. */
-function safeErrorMessage(err: unknown): string {
+/**
+ * Log full error to stderr and return a sanitized message for MCP clients.
+ *
+ * Exported for tests: this function decides what leaves the process, so its
+ * matching needs to be verifiable rather than assumed.
+ *
+ * `\bAPI\b` rather than a bare `API` substring — the loose form swallowed any
+ * message containing "capacity", "rapid", "capital" and reported it as an LLM
+ * failure, which sends debugging in entirely the wrong direction.
+ */
+export function safeErrorMessage(err: unknown): string {
   const msg = (err as Error).message || "Unknown error";
   console.error("ESIM error:", msg);
-  // TODO: restore sanitization after debugging
-  return `DEBUG: ${msg}`;
-  if (/fetch|openai|openrouter|embedding.*failed|API/i.test(msg)) {
-    return "LLM API request failed";
-  }
+  // Configuration first: it is the more specific pattern. Checked the other way
+  // round, "Missing OPENAI_API_KEY" matches `openai` and gets reported as an
+  // LLM failure, sending you to the provider's status page over an unset env var.
   if (/Missing.*KEY|Missing.*URI|Missing.*credentials/i.test(msg)) {
     return "Server configuration error — check environment variables";
+  }
+  if (/fetch|openai|openrouter|embedding.*failed|\bAPI\b/i.test(msg)) {
+    return "LLM API request failed";
   }
   // Operational errors (invalid input, not found, etc.) are safe to pass through
   return msg;
@@ -67,6 +83,20 @@ const propertiesSchema = (description: string) =>
     (val) => (typeof val === "string" ? JSON.parse(val) : val),
     z.record(z.unknown()).optional()
   ).describe(description);
+
+/**
+ * Closed vocabularies for Signal lifecycle fields, surfaced as real JSON Schema
+ * enums so the legal values are visible to callers at the tool boundary rather
+ * than only to the reader in processing_summary. That split — reader knows the
+ * vocabulary, writer does not — is what allowed values like "refuted" and
+ * "processed" to be written and then silently dropped from every count.
+ */
+const signalStatusSchema = z.enum(
+  [...KNOWN_SIGNAL_STATUSES] as [string, ...string[]]
+);
+const signalDispositionSchema = z.enum(
+  [...KNOWN_SIGNAL_DISPOSITIONS] as [string, ...string[]]
+);
 
 /** Parse JSON string or pass-through object for required properties fields. */
 const requiredPropertiesSchema = (description: string) =>
@@ -170,7 +200,7 @@ export function createServer(): McpServer {
     {
       title: "Create Entity",
       description:
-        "Create any entity node (Agent, Need, Resource, Constraint, Output, Role). Auto-generates embedding and extracts metadata via LLM. Explicit properties override LLM-extracted values.",
+        "Create any entity node (Agent, System, Need, Resource, Constraint, Output, Role). Auto-generates embedding and extracts metadata via LLM. Explicit properties override LLM-extracted values.",
       inputSchema: {
         entity_type: z
           .enum(ENTITY_LABELS)
@@ -232,7 +262,7 @@ export function createServer(): McpServer {
     {
       title: "Create Signal",
       description:
-        "Capture an observation with optional context. Auto-creates OBSERVED_BY and optional SIGNALS + PRODUCED_IN edges in one transaction. Observer-authored fields (observation, context, how_observed, confidence, perceived_impact) are sacred — never overwritten by the system.",
+        "Capture an observation with optional context. Auto-creates OBSERVED_BY and optional SIGNALS + PRODUCED_IN edges in one transaction. Observer-authored fields (observation, context, how_observed, confidence, perceived_impact) are sacred — never overwritten by the system. `status` and `disposition` are closed vocabularies read by processing_summary; when neither has a precise enough word for what you mean, use `outcome` for the exact term and pick the closest enum value.",
       inputSchema: {
         observation: z
           .string()
@@ -253,7 +283,24 @@ export function createServer(): McpServer {
           .string()
           .optional()
           .describe("ID of the session where this was captured"),
-        properties: propertiesSchema("Additional properties (how_observed, confidence, perceived_impact, disposition, disposition_note, etc.)"),
+        status: signalStatusSchema
+          .optional()
+          .describe(
+            "Processing lifecycle state. Closed vocabulary — drives processing_summary and every processing sweep. Defaults to unprocessed."
+          ),
+        disposition: signalDispositionSchema
+          .optional()
+          .describe(
+            "How this signal relates to existing structure once processed. Closed vocabulary — drives processing_summary."
+          ),
+        outcome: z
+          .string()
+          .max(120)
+          .optional()
+          .describe(
+            "Free text: the precise word for how this resolved, when the closed vocabularies are too coarse (e.g. 'refuted', 'confirmed_separate_initiative'). Human-read only; never bucketed. Use this INSTEAD of inventing a new status/disposition value."
+          ),
+        properties: propertiesSchema("Additional properties (how_observed, confidence, perceived_impact, disposition_note, etc.). Note: status/disposition written here are validated against the same closed vocabularies as the typed fields above — the bag is not a bypass."),
       },
     },
     async ({
@@ -262,9 +309,15 @@ export function createServer(): McpServer {
       observed_by_agent_id,
       signals_entity_id,
       produced_in_session_id,
+      status,
+      disposition,
+      outcome,
       properties,
     }) => {
       try {
+        // Validate before any embedding/extraction work, so a vocabulary
+        // mistake fails fast and cheap rather than after two model calls.
+        validateSignalVocabulary(properties as Record<string, unknown> | undefined);
         const combinedText = context
           ? `${observation}\n\nContext: ${context}`
           : observation;
@@ -282,6 +335,11 @@ export function createServer(): McpServer {
           content: combinedText,
           embedding,
           ...(properties || {}),
+          // Typed params last: they are schema-validated, so they win over
+          // anything the bag or the extractor supplied for the same key.
+          ...(status && { status }),
+          ...(disposition && { disposition }),
+          ...(outcome && { outcome }),
         };
 
         const query = createSignalQuery(
@@ -564,7 +622,7 @@ export function createServer(): McpServer {
     {
       title: "Create Relationship",
       description:
-        "Create any of the 23 relationship types between two nodes with optional edge properties.",
+        "Create any of the 26 relationship types between two nodes with optional edge properties.",
       inputSchema: {
         from_id: z.string().describe("Source node ID"),
         to_id: z.string().describe("Target node ID"),
@@ -604,6 +662,60 @@ export function createServer(): McpServer {
             {
               type: "text" as const,
               text: JSON.stringify(summary, null, 2),
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${safeErrorMessage(err)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ─── delete_relationship ──────────────────────────────────
+
+  server.registerTool(
+    "delete_relationship",
+    {
+      title: "Delete Relationship",
+      description:
+        "Delete a single relationship of the given type between two nodes. Does not touch the nodes themselves.",
+      inputSchema: {
+        from_id: z.string().describe("Source node ID"),
+        to_id: z.string().describe("Target node ID"),
+        relationship_type: z
+          .enum(RELATIONSHIP_TYPES)
+          .describe("Relationship type to delete"),
+      },
+    },
+    async ({ from_id, to_id, relationship_type }) => {
+      try {
+        const query = deleteRelationshipQuery(from_id, to_id, relationship_type);
+        const results = await runQuery(query);
+        const deleted = Number((results[0] as Record<string, unknown> | undefined)?.deleted ?? 0);
+
+        if (deleted === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `No ${relationship_type} relationship found from ${from_id} to ${to_id}.`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                { deleted: true, relationship_type, from_id, to_id },
+                null,
+                2
+              ),
             },
           ],
         };
@@ -760,6 +872,15 @@ export function createServer(): McpServer {
         }
 
         const existingNode = (existing[0] as Record<string, unknown>).n as Record<string, unknown>;
+        const labels = ((existing[0] as Record<string, unknown>).types as string[]) ?? [];
+
+        // update_node is a generic property setter, so it is the easiest route
+        // to writing an out-of-vocabulary status. Enforce the same rules here
+        // as at creation, but only for Signals — other node types use `status`
+        // with their own meanings (Session 'active', Discrepancy states, etc.).
+        if (labels.includes("Signal")) {
+          validateSignalVocabulary(properties as Record<string, unknown>);
+        }
 
         // Re-generate embedding if content or name changed
         const contentChanged = "content" in properties && properties.content !== existingNode.content;
@@ -838,13 +959,23 @@ export function createServer(): McpServer {
         ]);
 
         // Phase 3: Build props and create node
-        const mergedProps = {
+        const rawProps = {
           ...extracted,
           ...classification.hints,
           name,
           content,
           embedding,
         };
+
+        // `extracted` comes from an LLM, which can invent a plausible-sounding
+        // status or disposition. Sanitize rather than throw: this is an intake
+        // path, and losing the user's content to an extractor's word choice
+        // would be a worse failure than a dropped field. The invented value is
+        // preserved in `outcome`. Note captureQuery supplies the real default
+        // status afterwards, so dropping an invalid one here is safe.
+        const mergedProps = nodeType === "Signal"
+          ? sanitizeSignalVocabulary(rawProps)
+          : rawProps;
 
         const query = captureQuery(nodeType, mergedProps, isUnclassified);
         const results = await runQuery(query);
@@ -1170,7 +1301,7 @@ export function createServer(): McpServer {
     {
       title: "Processing Summary",
       description:
-        "Summarize signal processing status: counts by status (resolved, dismissed, under_review, unprocessed) and disposition (additive, redundant, contradictory, unrelated). Optionally scoped to a session.",
+        "Summarize signal processing status: counts by status (resolved, dismissed, under_review, unprocessed) and disposition (additive, redundant, contradictory, unrelated). Also returns a `reconciliation` block proving every signal was counted, and an `unrecognized` block listing any status/disposition values written outside the known vocabulary — if `unrecognized` is present, those signals are invisible to normal processing sweeps and should be normalized. Optionally scoped to a session.",
       inputSchema: {
         session_id: z
           .string()
@@ -1189,24 +1320,8 @@ export function createServer(): McpServer {
           };
         }
 
-        const row = results[0] as Record<string, number>;
-        const summary = {
-          total_signals: row.total,
-          by_status: {
-            resolved_into_update: row.resolved,
-            dismissed: row.dismissed,
-            under_review: row.under_review,
-            unprocessed: row.unprocessed,
-          },
-          by_disposition: {
-            additive: row.additive,
-            redundant: row.redundant,
-            contradictory: row.contradictory,
-            unrelated: row.unrelated,
-            no_disposition: row.no_disposition,
-          },
-          ...(session_id && { session_id }),
-        };
+        const row = results[0] as Record<string, unknown>;
+        const summary = buildProcessingSummary(row, session_id);
 
         return {
           content: [{ type: "text" as const, text: JSON.stringify(summary, null, 2) }],

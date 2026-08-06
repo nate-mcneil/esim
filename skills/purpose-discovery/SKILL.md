@@ -82,8 +82,8 @@ The graph we build here is **declared state** — what the user articulates abou
 - **Signal**: Observer-authored (sacred): `{ observation (required), context?, how_observed: direct_observation|reported|inferred|environmental, confidence: high|medium|low, perceived_impact: high|medium|low }`. System-authored (progressive): `{ system_interpretation?, structural_impact? }`. Engine-authored (lifecycle): `{ status: unprocessed|needs_classification|under_review|resolved_into_update|dismissed, disposition: redundant|additive|contradictory|unrelated, disposition_note? }`. Auto-generated: `{ content }` (for embedding).
 - **Session**: `{ name, session_type: discovery|calibration|review|planning, status: active|completed|paused }`
 
-### Relationship Types (23)
-PURPOSE (with purpose_type: create|sustain|transform|enable), CONTAINS, FILLS, GOVERNS, OWNS, SERVES, GENERATED_BY, REQUIRES, PRODUCES, EVALUATED_AGAINST, HAS_STOCK, SIGNALS, OBSERVED_BY, FLAGGED_AT, PRODUCED_IN, PARTICIPATES_IN, SCOPED_TO, TRIGGERED_BY, DEFINED_BY, ESCALATED_TO, RELATED_TO, AFFECTS, GOVERNED_BY
+### Relationship Types (26)
+PURPOSE (with purpose_type: create|sustain|transform|enable), CONTAINS, FILLS, GOVERNS, OWNS, SERVES, GENERATED_BY, REQUIRES, PRODUCES, EVALUATED_AGAINST, HAS_STOCK, SIGNALS, OBSERVED_BY, FLAGGED_AT, PRODUCED_IN, PARTICIPATES_IN, SCOPED_TO, TRIGGERED_BY, DEFINED_BY, ESCALATED_TO, RELATED_TO, AFFECTS, GOVERNED_BY, DEPENDS_ON, FLOWS_TO, RUNS_ON
 
 ### MCP Tool Reference
 - Create entities: `create_entity` (typed) or `capture` (auto-classified)

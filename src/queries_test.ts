@@ -4,7 +4,9 @@
 import { assertEquals, assertStringIncludes, assertThrows } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import {
   captureQuery,
+  createEntityQuery,
   deleteNodeQuery,
+  deleteRelationshipQuery,
   diagnosticQueries,
   listQuery,
   statsQueries,
@@ -15,8 +17,14 @@ import {
   attentionItemsQuery,
   structuralNeighborsQuery,
   batchCreateRelationshipsQuery,
+  buildProcessingSummary,
+  sanitizeSignalVocabulary,
+  validateSignalVocabulary,
+  KNOWN_SIGNAL_DISPOSITIONS,
+  KNOWN_SIGNAL_STATUSES,
   processingSummaryQuery,
 } from "./queries.ts";
+import { ENTITY_LABELS, RELATIONSHIP_TYPES } from "./types.ts";
 
 // ─── schemaSetupQueries ──────────────────────────────────────
 
@@ -54,6 +62,15 @@ Deno.test("captureQuery — entity type routes through LABEL_MAP", () => {
 Deno.test("captureQuery — Need gets Entity:Artifact:Need label", () => {
   const q = captureQuery("Need", { name: "Test Need", content: "something" }, false);
   assertStringIncludes(q.cypher, "Entity:Artifact:Need");
+});
+
+Deno.test("captureQuery — System gets Entity:Agent:System label", () => {
+  const q = captureQuery("System", { name: "Unified Analytics ETL" }, false);
+  assertStringIncludes(q.cypher, "Entity:Agent:System");
+  const props = q.params.props as Record<string, unknown>;
+  assertEquals(props.name, "Unified Analytics ETL");
+  assertEquals(typeof props.id, "string");
+  assertEquals(typeof props.created_at, "string");
 });
 
 Deno.test("captureQuery — Signal type creates Signal node", () => {
@@ -119,6 +136,17 @@ Deno.test("deleteNodeQuery — uses DETACH DELETE", () => {
   const q = deleteNodeQuery("test-id");
   assertStringIncludes(q.cypher, "DETACH DELETE");
   assertEquals(q.params.nodeId, "test-id");
+});
+
+// ─── deleteRelationshipQuery ────────────────────────────────
+
+Deno.test("deleteRelationshipQuery — matches directed edge by type and deletes it, not the nodes", () => {
+  const q = deleteRelationshipQuery("from-id", "to-id", "RELATED_TO");
+  assertStringIncludes(q.cypher, "(from {id: $fromId})-[r:RELATED_TO]->(to {id: $toId})");
+  assertStringIncludes(q.cypher, "DELETE r");
+  assertEquals(q.cypher.includes("DETACH"), false, "should not delete the nodes themselves");
+  assertEquals(q.params.fromId, "from-id");
+  assertEquals(q.params.toId, "to-id");
 });
 
 // ─── listQuery ───────────────────────────────────────────────
@@ -359,7 +387,10 @@ Deno.test("processingSummaryQuery — unscoped matches all signals", () => {
   const q = processingSummaryQuery();
   assertStringIncludes(q.cypher, "MATCH (s:Signal)");
   assertEquals(q.cypher.includes("PRODUCED_IN"), false);
-  assertEquals(Object.keys(q.params).length, 0);
+  // No session binding when unscoped. The query still carries the known-vocabulary
+  // params used for drift detection, so this asserts the absence of sessionId
+  // rather than an empty param set.
+  assertEquals(q.params.sessionId, undefined);
 });
 
 Deno.test("processingSummaryQuery — returns all disposition counts", () => {
@@ -368,4 +399,256 @@ Deno.test("processingSummaryQuery — returns all disposition counts", () => {
   assertStringIncludes(q.cypher, "redundant");
   assertStringIncludes(q.cypher, "contradictory");
   assertStringIncludes(q.cypher, "unrelated");
+});
+
+Deno.test("processingSummaryQuery — collects values outside the known vocabulary", () => {
+  const q = processingSummaryQuery();
+  assertStringIncludes(q.cypher, "unknown_statuses");
+  assertStringIncludes(q.cypher, "unknown_dispositions");
+  assertStringIncludes(q.cypher, "NOT s.status IN $knownStatuses");
+  assertStringIncludes(q.cypher, "NOT s.disposition IN $knownDispositions");
+});
+
+Deno.test("processingSummaryQuery — passes known vocabulary as params", () => {
+  const q = processingSummaryQuery();
+  assertEquals(q.params.knownStatuses, KNOWN_SIGNAL_STATUSES);
+  assertEquals(q.params.knownDispositions, KNOWN_SIGNAL_DISPOSITIONS);
+  // Session scoping must not clobber the vocabulary params.
+  const scoped = processingSummaryQuery("session-123");
+  assertEquals(scoped.params.sessionId, "session-123");
+  assertEquals(scoped.params.knownStatuses, KNOWN_SIGNAL_STATUSES);
+});
+
+Deno.test("processingSummaryQuery — known vocabulary covers every bucket it counts", () => {
+  const q = processingSummaryQuery();
+  // Each bucketed literal must also be in the known list, or a value would be
+  // counted in by_status/by_disposition AND reported as unrecognized.
+  const statuses: readonly string[] = KNOWN_SIGNAL_STATUSES;
+  const dispositions: readonly string[] = KNOWN_SIGNAL_DISPOSITIONS;
+  for (const status of ["resolved_into_update", "dismissed", "under_review", "unprocessed"]) {
+    assertStringIncludes(q.cypher, status);
+    assertEquals(statuses.includes(status), true);
+  }
+  for (const d of ["additive", "redundant", "contradictory", "unrelated"]) {
+    assertEquals(dispositions.includes(d), true);
+  }
+});
+
+Deno.test("processingSummaryQuery — counts signals with no status at all", () => {
+  const q = processingSummaryQuery();
+  assertStringIncludes(q.cypher, "s.status IS NULL THEN 1 END) AS no_status");
+});
+
+// ─── buildProcessingSummary ───────────────────────────────────
+
+Deno.test("buildProcessingSummary — omits unrecognized when vocabulary is clean", () => {
+  const summary = buildProcessingSummary({
+    total: 3,
+    resolved: 2,
+    unprocessed: 1,
+    additive: 3,
+    unknown_statuses: [],
+    unknown_dispositions: [],
+  });
+  assertEquals("unrecognized" in summary, false);
+  assertEquals(summary.reconciliation.balanced, true);
+});
+
+Deno.test("buildProcessingSummary — names drifted values and keeps the books balanced", () => {
+  // Fixture mirrors the real graph state on 2026-08-06: 28 signals where four
+  // dispositions were written outside the enum. Before this change those four
+  // vanished from by_disposition with no trace (24 counted against 28 total).
+  const summary = buildProcessingSummary({
+    total: 28,
+    resolved: 26,
+    unprocessed: 2,
+    additive: 24,
+    unknown_statuses: [],
+    unknown_dispositions: [
+      "refuted",
+      "confirmed_separate_initiative",
+      "needs_review",
+      "unresolved",
+    ],
+  });
+
+  assertEquals(summary.unrecognized, {
+    disposition: {
+      refuted: 1,
+      confirmed_separate_initiative: 1,
+      needs_review: 1,
+      unresolved: 1,
+    },
+  });
+  // 24 bucketed + 4 unrecognized = 28. The gap is now visible, not lost.
+  assertEquals(summary.reconciliation.disposition_counted, 28);
+  assertEquals(summary.reconciliation.status_counted, 28);
+  assertEquals(summary.reconciliation.balanced, true);
+});
+
+Deno.test("buildProcessingSummary — repeated drifted values are tallied, not deduped", () => {
+  const summary = buildProcessingSummary({
+    total: 4,
+    resolved: 1,
+    additive: 1,
+    unknown_statuses: ["processed", "processed", "archived"],
+    unknown_dispositions: ["refuted", "refuted", "refuted"],
+  });
+  assertEquals(summary.unrecognized?.status, { processed: 2, archived: 1 });
+  assertEquals(summary.unrecognized?.disposition, { refuted: 3 });
+  assertEquals(summary.reconciliation.status_counted, 4);
+});
+
+Deno.test("buildProcessingSummary — flags imbalance rather than hiding it", () => {
+  // A row where the buckets genuinely do not add up to the total: 10 signals
+  // but only 5 accounted for. `balanced` must go false.
+  const summary = buildProcessingSummary({
+    total: 10,
+    resolved: 5,
+    additive: 5,
+    unknown_statuses: [],
+    unknown_dispositions: [],
+  });
+  assertEquals(summary.reconciliation.status_counted, 5);
+  assertEquals(summary.reconciliation.balanced, false);
+});
+
+Deno.test("buildProcessingSummary — missing counts default to zero, not NaN", () => {
+  const summary = buildProcessingSummary({ total: 0 });
+  assertEquals(summary.total_signals, 0);
+  assertEquals(summary.by_status.resolved_into_update, 0);
+  assertEquals(summary.by_disposition.no_disposition, 0);
+  assertEquals(summary.reconciliation.balanced, true);
+});
+
+// ─── Signal vocabulary enforcement ────────────────────────────
+
+Deno.test("validateSignalVocabulary — accepts every value the summary buckets", () => {
+  for (const status of KNOWN_SIGNAL_STATUSES) {
+    validateSignalVocabulary({ status });
+  }
+  for (const disposition of KNOWN_SIGNAL_DISPOSITIONS) {
+    validateSignalVocabulary({ disposition });
+  }
+});
+
+Deno.test("validateSignalVocabulary — no-ops on absent, undefined, or empty props", () => {
+  validateSignalVocabulary(undefined);
+  validateSignalVocabulary({});
+  validateSignalVocabulary({ status: undefined, disposition: undefined });
+  // Unrelated keys are none of its business.
+  validateSignalVocabulary({ observation: "x", confidence: "high" });
+});
+
+Deno.test("validateSignalVocabulary — rejects the exact values that drifted in practice", () => {
+  // Every one of these was written to the real graph and silently dropped.
+  for (const status of ["processed", "resolved"]) {
+    assertThrows(
+      () => validateSignalVocabulary({ status }),
+      Error,
+      `Invalid Signal status "${status}"`,
+    );
+  }
+  for (const disposition of ["refuted", "confirmed_separate_initiative", "needs_review", "unresolved"]) {
+    assertThrows(
+      () => validateSignalVocabulary({ disposition }),
+      Error,
+      `Invalid Signal disposition "${disposition}"`,
+    );
+  }
+});
+
+Deno.test("validateSignalVocabulary — error names the legal values and points at outcome", () => {
+  assertThrows(
+    () => validateSignalVocabulary({ disposition: "refuted" }),
+    Error,
+    // Naming the escape hatch is the part that prevents the next invented field.
+    "`outcome`",
+  );
+  assertThrows(
+    () => validateSignalVocabulary({ status: "processed" }),
+    Error,
+    "resolved_into_update",
+  );
+});
+
+Deno.test("validateSignalVocabulary — rejects non-string values", () => {
+  assertThrows(() => validateSignalVocabulary({ status: 1 }), Error, "Invalid Signal status");
+  assertThrows(() => validateSignalVocabulary({ disposition: true }), Error, "Invalid Signal disposition");
+});
+
+Deno.test("validateSignalVocabulary — null is treated as absent, not invalid", () => {
+  // Distinct from an invalid value: an explicit null means "no disposition",
+  // which processing_summary already counts in its own bucket.
+  validateSignalVocabulary({ status: null, disposition: null });
+});
+
+Deno.test("sanitizeSignalVocabulary — preserves an invented value in outcome instead of losing it", () => {
+  const out = sanitizeSignalVocabulary({
+    observation: "x",
+    status: "totally-made-up",
+  });
+  assertEquals("status" in out, false);
+  assertEquals(out.outcome, "totally-made-up");
+  assertEquals(out.observation, "x");
+});
+
+Deno.test("sanitizeSignalVocabulary — never clobbers an outcome the caller already set", () => {
+  const out = sanitizeSignalVocabulary({
+    disposition: "invented",
+    outcome: "authored by a human",
+  });
+  assertEquals(out.outcome, "authored by a human");
+  assertEquals("disposition" in out, false);
+});
+
+Deno.test("sanitizeSignalVocabulary — leaves valid values untouched and does not mutate input", () => {
+  const input = { status: "unprocessed", disposition: "additive", observation: "x" };
+  const out = sanitizeSignalVocabulary(input);
+  assertEquals(out, input);
+  assertEquals(input.status, "unprocessed", "input must not be mutated");
+});
+
+Deno.test("buildProcessingSummary — passes through session scoping", () => {
+  const scoped = buildProcessingSummary({ total: 1, resolved: 1, additive: 1 }, "session-123");
+  assertEquals((scoped as { session_id?: string }).session_id, "session-123");
+  const unscoped = buildProcessingSummary({ total: 1, resolved: 1, additive: 1 });
+  assertEquals("session_id" in unscoped, false);
+});
+
+// ─── System entity + system relationships ─────────────────────
+
+Deno.test("createEntityQuery — System routes to Entity:Agent:System label", () => {
+  const q = createEntityQuery("System", { name: "Snowflake" });
+  assertStringIncludes(q.cypher, "Entity:Agent:System");
+  assertStringIncludes(q.cypher, "CREATE");
+  const props = q.params.props as Record<string, unknown>;
+  assertEquals(props.name, "Snowflake");
+  assertEquals(typeof props.id, "string");
+  assertEquals(typeof props.created_at, "string");
+  assertEquals(typeof props.updated_at, "string");
+});
+
+Deno.test("ENTITY_LABELS — includes System", () => {
+  assertEquals(ENTITY_LABELS.includes("System"), true);
+});
+
+Deno.test("RELATIONSHIP_TYPES — includes the three system edges", () => {
+  assertEquals(RELATIONSHIP_TYPES.includes("DEPENDS_ON"), true);
+  assertEquals(RELATIONSHIP_TYPES.includes("FLOWS_TO"), true);
+  assertEquals(RELATIONSHIP_TYPES.includes("RUNS_ON"), true);
+  assertEquals(RELATIONSHIP_TYPES.length, 26);
+});
+
+Deno.test("batchCreateRelationshipsQuery — accepts system edge types with props", () => {
+  const queries = batchCreateRelationshipsQuery([
+    { from_id: "etl", to_id: "pg", relationship_type: "DEPENDS_ON", properties: { criticality: "hard" } },
+    { from_id: "extract", to_id: "transform", relationship_type: "FLOWS_TO", properties: { mode: "batch" } },
+    { from_id: "etl", to_id: "cluster", relationship_type: "RUNS_ON", properties: { environment: "prod" } },
+  ]);
+  assertEquals(queries.length, 3);
+  assertStringIncludes(queries[0].cypher, "DEPENDS_ON");
+  assertStringIncludes(queries[1].cypher, "FLOWS_TO");
+  assertStringIncludes(queries[2].cypher, "RUNS_ON");
+  assertStringIncludes(queries[0].cypher, "$relProps");
 });

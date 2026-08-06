@@ -4,6 +4,7 @@
 
 export const ENTITY_LABELS = [
   "Agent",
+  "System",
   "Need",
   "Resource",
   "Constraint",
@@ -50,6 +51,9 @@ export const RELATIONSHIP_TYPES = [
   "RELATED_TO",
   "AFFECTS",
   "GOVERNED_BY",
+  "DEPENDS_ON",
+  "FLOWS_TO",
+  "RUNS_ON",
 ] as const;
 
 export type RelationshipType = (typeof RELATIONSHIP_TYPES)[number];
@@ -108,6 +112,17 @@ export interface OutputNode extends BaseNode, EmbeddableNode {
 
 export interface RoleNode extends BaseNode, EmbeddableNode {
   name: string;
+}
+
+// A technical system — service, pipeline, datastore, host, or device.
+// Physically an Agent sub-label (Entity:Agent:System, see LABEL_MAP), so it
+// inherits Agent semantics, the entity vector index, and every Agent diagnostic.
+// Kind and software-vs-hardware are read from structure (RUNS_ON target = hardware,
+// CONTAINS shape = pipeline/stage), not a governed prop — see docs/systems-schema-design.md.
+export interface SystemNode extends BaseNode, EmbeddableNode {
+  name: string;
+  capacity?: number;
+  is_root?: boolean;
 }
 
 // ─── Non-Entity Nodes ─────────────────────────────────────────
@@ -195,6 +210,24 @@ export interface AffectsEdgeProps {
 
 export interface GovernedByEdgeProps {
   resolution_principle?: string;
+}
+
+// ─── System relationship properties ───────────────────────────
+
+export interface DependsOnEdgeProps {
+  dependency_type?: "runtime" | "buildtime" | "data" | "config";
+  criticality?: "hard" | "soft";
+}
+
+export interface FlowsToEdgeProps {
+  mode?: "batch" | "stream" | "sync" | "async";
+  payload?: string;
+  volume?: string;
+}
+
+export interface RunsOnEdgeProps {
+  environment?: "prod" | "staging" | "dev";
+  region?: string;
 }
 
 // ─── Classification ─────────────────────────────────────────

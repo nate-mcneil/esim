@@ -60,6 +60,7 @@ OPTIONS { indexConfig: { \`vector.dimensions\`: ${dimensions}, \`vector.similari
 
 const LABEL_MAP: Record<string, string> = {
   Agent: "Entity:Agent",
+  System: "Entity:Agent:System",
   Need: "Entity:Artifact:Need",
   Resource: "Entity:Artifact:Resource",
   Constraint: "Entity:Artifact:Constraint",
@@ -268,6 +269,21 @@ RETURN from, r, to`,
       toId,
       ...(propsClause && { relProps: props }),
     },
+  };
+}
+
+// ─── Delete Relationship ──────────────────────────────────────
+
+export function deleteRelationshipQuery(
+  fromId: string,
+  toId: string,
+  relType: RelationshipType
+): CypherQuery {
+  return {
+    cypher: `MATCH (from {id: $fromId})-[r:${relType}]->(to {id: $toId})
+DELETE r
+RETURN count(r) AS deleted`,
+    params: { fromId, toId },
   };
 }
 
@@ -809,6 +825,180 @@ RETURN from.id AS from_id, to.id AS to_id, type(r) AS type`,
 
 // ─── Processing Summary ──────────────────────────────────────
 
+/**
+ * Status values processing_summary knows how to bucket. `needs_classification`
+ * is a legacy synonym folded into `unprocessed`.
+ *
+ * Anything written to Signal.status outside this list is drift: the value is
+ * a perfectly good string, so neither Neo4j nor the create_signal input schema
+ * rejects it, but it silently falls out of every count here. Keep this list in
+ * sync with the enum enforced at the tool boundary.
+ */
+export const KNOWN_SIGNAL_STATUSES = [
+  "resolved_into_update",
+  "dismissed",
+  "under_review",
+  "unprocessed",
+  "needs_classification",
+] as const;
+
+/** Disposition values processing_summary knows how to bucket. See above. */
+export const KNOWN_SIGNAL_DISPOSITIONS = [
+  "additive",
+  "redundant",
+  "contradictory",
+  "unrelated",
+] as const;
+
+/**
+ * Thrown when a Signal write uses a status/disposition outside the vocabulary.
+ *
+ * The message deliberately points at `outcome`. Every drifted value observed in
+ * practice ("refuted", "confirmed_separate_initiative") was a BETTER word than
+ * the enum offered, so an error that only says "not allowed" would push the
+ * next precise word into some other improvised field. Naming the escape hatch
+ * is the part that stops recurrence.
+ */
+export function signalVocabularyError(
+  field: "status" | "disposition",
+  value: unknown,
+  allowed: readonly string[],
+): Error {
+  return new Error(
+    `Invalid Signal ${field} ${JSON.stringify(value)}. ` +
+      `Allowed: ${allowed.join(", ")}. ` +
+      `If none of these is precise enough, put the exact word in \`outcome\` ` +
+      `(free text) and set \`${field}\` to the closest listed value — that keeps ` +
+      `the signal visible to processing_summary without losing your meaning.`,
+  );
+}
+
+/**
+ * Validates Signal vocabulary fields on a property bag, whatever route it
+ * arrived by.
+ *
+ * Applied to the free-form `properties` object as well as typed parameters,
+ * because a typed field the caller can bypass by writing the same key into an
+ * untyped bag is not a constraint. Absent fields are fine; this never invents
+ * defaults.
+ */
+export function validateSignalVocabulary(
+  props: Record<string, unknown> | undefined,
+): void {
+  if (!props) return;
+  const check = (field: "status" | "disposition", allowed: readonly string[]) => {
+    const value = props[field];
+    if (value === undefined || value === null) return;
+    if (typeof value !== "string" || !allowed.includes(value)) {
+      throw signalVocabularyError(field, value, allowed);
+    }
+  };
+  check("status", KNOWN_SIGNAL_STATUSES);
+  check("disposition", KNOWN_SIGNAL_DISPOSITIONS);
+}
+
+/**
+ * Non-throwing variant for machine-generated props (LLM metadata extraction).
+ *
+ * Intake paths must not lose the user's content because an extractor invented
+ * a plausible-sounding status, so an invalid value is moved into `outcome`
+ * (when free) and the offending field dropped rather than raising. Returns a
+ * new object; does not mutate the input.
+ */
+export function sanitizeSignalVocabulary(
+  props: Record<string, unknown>,
+): Record<string, unknown> {
+  const out = { ...props };
+  const salvage = (field: "status" | "disposition", allowed: readonly string[]) => {
+    const value = out[field];
+    if (value === undefined || value === null) return;
+    if (typeof value === "string" && allowed.includes(value)) return;
+    if (out.outcome === undefined && typeof value === "string") {
+      out.outcome = value;
+    }
+    delete out[field];
+  };
+  salvage("status", KNOWN_SIGNAL_STATUSES);
+  salvage("disposition", KNOWN_SIGNAL_DISPOSITIONS);
+  return out;
+}
+
+/**
+ * Shapes a processingSummaryQuery result row into the tool's response.
+ *
+ * Pure, so the bucketing and reconciliation arithmetic is testable without a
+ * database. Two invariants it exists to guarantee:
+ *   1. Every signal lands in exactly one bucket per dimension, or is named in
+ *      `unrecognized`. Nothing is silently dropped.
+ *   2. `unrecognized` is absent when the vocabulary is clean, so its mere
+ *      presence is the drift alarm.
+ */
+export function buildProcessingSummary(
+  row: Record<string, unknown>,
+  sessionId?: string,
+) {
+  const num = (k: string) => (row[k] as number) ?? 0;
+
+  // Tallied here rather than in Cypher to keep the query readable. Drift is
+  // rare by definition, so these lists are short.
+  const tally = (values: unknown): Record<string, number> => {
+    const counts: Record<string, number> = {};
+    for (const v of (values as string[]) ?? []) {
+      counts[v] = (counts[v] ?? 0) + 1;
+    }
+    return counts;
+  };
+  const unknownStatuses = tally(row.unknown_statuses);
+  const unknownDispositions = tally(row.unknown_dispositions);
+
+  const sum = (counts: Record<string, number>) =>
+    Object.values(counts).reduce((a, b) => a + b, 0);
+
+  const byStatus = {
+    resolved_into_update: num("resolved"),
+    dismissed: num("dismissed"),
+    under_review: num("under_review"),
+    unprocessed: num("unprocessed"),
+    no_status: num("no_status"),
+  };
+  const byDisposition = {
+    additive: num("additive"),
+    redundant: num("redundant"),
+    contradictory: num("contradictory"),
+    unrelated: num("unrelated"),
+    no_disposition: num("no_disposition"),
+  };
+
+  const total = num("total");
+  const statusCounted = sum(byStatus) + sum(unknownStatuses);
+  const dispositionCounted = sum(byDisposition) + sum(unknownDispositions);
+  const hasDrift = Object.keys(unknownStatuses).length > 0 ||
+    Object.keys(unknownDispositions).length > 0;
+
+  return {
+    total_signals: total,
+    by_status: byStatus,
+    by_disposition: byDisposition,
+    // If `balanced` is ever false, a value is being dropped somewhere that
+    // neither the known buckets nor `unrecognized` account for.
+    reconciliation: {
+      total,
+      status_counted: statusCounted,
+      disposition_counted: dispositionCounted,
+      balanced: statusCounted === total && dispositionCounted === total,
+    },
+    ...(hasDrift && {
+      unrecognized: {
+        ...(Object.keys(unknownStatuses).length > 0 && { status: unknownStatuses }),
+        ...(Object.keys(unknownDispositions).length > 0 && {
+          disposition: unknownDispositions,
+        }),
+      },
+    }),
+    ...(sessionId && { session_id: sessionId }),
+  };
+}
+
 export function processingSummaryQuery(sessionId?: string): CypherQuery {
   const sessionMatch = sessionId
     ? `MATCH (s:Signal)-[:PRODUCED_IN]->(session:Session {id: $sessionId})`
@@ -823,13 +1013,23 @@ WITH total,
   count(CASE WHEN s.status = 'dismissed' THEN 1 END) AS dismissed,
   count(CASE WHEN s.status = 'under_review' THEN 1 END) AS under_review,
   count(CASE WHEN s.status IN ['unprocessed', 'needs_classification'] THEN 1 END) AS unprocessed,
+  count(CASE WHEN s.status IS NULL THEN 1 END) AS no_status,
   count(CASE WHEN s.disposition = 'additive' THEN 1 END) AS additive,
   count(CASE WHEN s.disposition = 'redundant' THEN 1 END) AS redundant,
   count(CASE WHEN s.disposition = 'contradictory' THEN 1 END) AS contradictory,
   count(CASE WHEN s.disposition = 'unrelated' THEN 1 END) AS unrelated,
-  count(CASE WHEN s.disposition IS NULL THEN 1 END) AS no_disposition
-RETURN total, resolved, dismissed, under_review, unprocessed,
-  additive, redundant, contradictory, unrelated, no_disposition`,
-    params: sessionId ? { sessionId } : {},
+  count(CASE WHEN s.disposition IS NULL THEN 1 END) AS no_disposition,
+  collect(CASE WHEN s.status IS NOT NULL AND NOT s.status IN $knownStatuses
+    THEN s.status END) AS unknown_statuses,
+  collect(CASE WHEN s.disposition IS NOT NULL AND NOT s.disposition IN $knownDispositions
+    THEN s.disposition END) AS unknown_dispositions
+RETURN total, resolved, dismissed, under_review, unprocessed, no_status,
+  additive, redundant, contradictory, unrelated, no_disposition,
+  unknown_statuses, unknown_dispositions`,
+    params: {
+      ...(sessionId ? { sessionId } : {}),
+      knownStatuses: [...KNOWN_SIGNAL_STATUSES],
+      knownDispositions: [...KNOWN_SIGNAL_DISPOSITIONS],
+    },
   };
 }

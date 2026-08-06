@@ -1,0 +1,5 @@
+{
+  "name": "org",
+  "description": "Build and navigate an organization knowledge graph — structure, people, products, and technical systems — on top of ESIM's graph.",
+  "version": "0.1.0"
+}
