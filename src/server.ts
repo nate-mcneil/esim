@@ -3,7 +3,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "npm:zod@3";
 import { runQuery, runInTransaction } from "./db.ts";
-import { getEmbedding, getEmbeddings, extractMetadata, shouldSkipExtraction, getLlmConfig } from "./llm.ts";
+import { getEmbedding, getEmbeddings, getQueryEmbedding, extractMetadata, shouldSkipExtraction, getLlmConfig } from "./llm.ts";
 import { classifyContent } from "./classify.ts";
 import { buildContext } from "./context.ts";
 import {
@@ -462,7 +462,9 @@ export function createServer(): McpServer {
     },
     async ({ query: searchText, index, limit, threshold }) => {
       try {
-        const embedding = await getEmbedding(searchText);
+        // Query-side embedding: applies the instruction prefix for
+        // instruction-tuned models. Stored content must NOT get it.
+        const embedding = await getQueryEmbedding(searchText);
 
         const indexMap: Record<string, string> = {
           entity: VECTOR_INDEXES.Entity,

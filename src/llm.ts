@@ -50,6 +50,73 @@ function embeddingMaxChars(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_EMBEDDING_MAX_CHARS;
 }
 
+// ─── Query-side instruction prefix ───────────────────────────
+
+/**
+ * Instruction prepended to SEARCH QUERIES (never to stored documents) for
+ * instruction-tuned embedding models.
+ *
+ * Qwen3-Embedding is trained with an asymmetric convention: queries carry a
+ * task instruction, documents go in raw. esim sent both raw, and measurement
+ * on this graph (17 queries, k=20, qwen3-embedding:8b) showed the cost is
+ * concentrated in keyword-style queries rather than spread evenly:
+ *
+ *   MRR@20     0.808 -> 0.915        top-1  13/17 -> 15/17     missed 1 -> 0
+ *   "GAS AppType Inktavo Auth0 Organization Mission Control"   rank  9 -> 1
+ *   "Auth0 Printavo authentication spike effort estimate"      rank >20 -> 1
+ *   "Which team owns the Airflow and Looker data stack?"       rank  8 -> 19
+ *
+ * Read that honestly: 14 of 17 queries were unchanged, and one well-formed
+ * natural-language question got WORSE. The win is real but narrow, showing up
+ * where the query reads as keywords rather than a question. Two different
+ * instruction wordings scored 0.915 vs 0.916, so the benefit comes from having
+ * an instruction at all, not from this particular sentence.
+ */
+export const DEFAULT_QUERY_INSTRUCTION =
+  "Given a search query, retrieve relevant documents that answer the query";
+
+/** Models whose training expects the query-side instruction convention. */
+const INSTRUCTION_TUNED_EMBEDDING_MODELS = /qwen3-embedding/i;
+
+/**
+ * The instruction to use, or null to send queries raw.
+ *
+ * Gated on the model because this is not a universal improvement: sent to
+ * OpenAI's text-embedding-3-small the prefix is just noise occupying the input.
+ * LLM_QUERY_INSTRUCTION overrides — set it to force a custom instruction, or to
+ * the empty string to disable entirely on a model that would otherwise get one.
+ */
+function queryInstruction(): string | null {
+  const explicit = Deno.env.get("LLM_QUERY_INSTRUCTION");
+  if (explicit !== undefined) return explicit.trim() === "" ? null : explicit;
+  return INSTRUCTION_TUNED_EMBEDDING_MODELS.test(getLlmConfig().embeddingModel)
+    ? DEFAULT_QUERY_INSTRUCTION
+    : null;
+}
+
+/**
+ * Wraps a search query in the model's expected instruction format.
+ *
+ * Exported for tests and for the retrieval eval harness; call sites should
+ * generally use getQueryEmbedding instead.
+ */
+export function formatQueryForEmbedding(query: string): string {
+  const instruction = queryInstruction();
+  return instruction ? `Instruct: ${instruction}\nQuery: ${query}` : query;
+}
+
+/**
+ * Embeds a SEARCH QUERY. Use this for anything a user is searching WITH; use
+ * getEmbedding for content being stored.
+ *
+ * Keeping the two paths distinct is the whole point: prefixing stored content
+ * would break the asymmetry the model expects AND require re-embedding the
+ * entire graph. Query-side only means this change costs nothing at rest.
+ */
+export async function getQueryEmbedding(query: string): Promise<number[]> {
+  return await getEmbedding(formatQueryForEmbedding(query));
+}
+
 /**
  * Cuts text to a length the embedding model can handle.
  *

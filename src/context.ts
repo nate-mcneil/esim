@@ -1,7 +1,7 @@
 // ESIM — Context reconstruction from graph anchors
 
 import { runQuery } from "./db.ts";
-import { getEmbedding } from "./llm.ts";
+import { getQueryEmbedding } from "./llm.ts";
 import { searchQuery } from "./queries.ts";
 import {
   activeSessionsForEntitiesQuery,
@@ -39,7 +39,7 @@ export async function buildContext(
     anchors = [{ id: entityId, types: [] }];
   } else {
     // Semantic search for top 3 matching entities
-    const embedding = await getEmbedding(query);
+    const embedding = await getQueryEmbedding(query);
     const q = searchQuery(embedding, VECTOR_INDEXES.Entity, 3, 0.5);
     const results = await runQuery<Record<string, unknown>>(q);
 
@@ -78,7 +78,7 @@ export async function buildContext(
   // Flag items from structural neighbors that are semantically distant from the query
   let discoveries: unknown[] = [];
   if (includeDiscoveries && neighbors.length > 0) {
-    const embedding = await getEmbedding(query);
+    const embedding = await getQueryEmbedding(query);
     // Search signals index for semantically related content
     const signalResults = await runQuery<Record<string, unknown>>(
       searchQuery(embedding, VECTOR_INDEXES.Signal, 5, 0.3)

@@ -1,8 +1,31 @@
 // Unit tests for embedding input handling
 // Run: deno test src/llm_test.ts --allow-env
 
-import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
-import { DEFAULT_EMBEDDING_MAX_CHARS, truncateForEmbedding } from "./llm.ts";
+import { assertEquals, assertStringIncludes } from "https://deno.land/std@0.224.0/assert/mod.ts";
+import {
+  DEFAULT_EMBEDDING_MAX_CHARS,
+  DEFAULT_QUERY_INSTRUCTION,
+  formatQueryForEmbedding,
+  truncateForEmbedding,
+} from "./llm.ts";
+
+/** Run body with env vars set, restoring whatever was there before. */
+function withEnv(vars: Record<string, string | undefined>, body: () => void) {
+  const previous = new Map<string, string | undefined>();
+  for (const k of Object.keys(vars)) previous.set(k, Deno.env.get(k));
+  try {
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) Deno.env.delete(k);
+      else Deno.env.set(k, v);
+    }
+    body();
+  } finally {
+    for (const [k, v] of previous) {
+      if (v === undefined) Deno.env.delete(k);
+      else Deno.env.set(k, v);
+    }
+  }
+}
 
 // ─── truncateForEmbedding ─────────────────────────────────────
 
@@ -84,4 +107,59 @@ Deno.test("truncateForEmbedding — LLM_EMBEDDING_MAX_CHARS overrides the defaul
     if (original === undefined) Deno.env.delete("LLM_EMBEDDING_MAX_CHARS");
     else Deno.env.set("LLM_EMBEDDING_MAX_CHARS", original);
   }
+});
+
+// ─── formatQueryForEmbedding ──────────────────────────────────
+
+Deno.test("formatQueryForEmbedding — prefixes for instruction-tuned Qwen3 models", () => {
+  withEnv({ LLM_EMBEDDING_MODEL: "qwen3-embedding:8b", LLM_QUERY_INSTRUCTION: undefined }, () => {
+    const out = formatQueryForEmbedding("who owns GAS?");
+    assertStringIncludes(out, `Instruct: ${DEFAULT_QUERY_INSTRUCTION}`);
+    assertStringIncludes(out, "Query: who owns GAS?");
+  });
+  // Size variant of the same family must also qualify.
+  withEnv({ LLM_EMBEDDING_MODEL: "qwen3-embedding:0.6b", LLM_QUERY_INSTRUCTION: undefined }, () => {
+    assertStringIncludes(formatQueryForEmbedding("x"), "Instruct:");
+  });
+});
+
+Deno.test("formatQueryForEmbedding — leaves non-instruction-tuned models alone", () => {
+  // Sent to OpenAI the prefix is noise occupying the input, not a no-op.
+  for (const model of ["text-embedding-3-small", "text-embedding-ada-002", "nomic-embed-text"]) {
+    withEnv({ LLM_EMBEDDING_MODEL: model, LLM_QUERY_INSTRUCTION: undefined }, () => {
+      assertEquals(formatQueryForEmbedding("who owns GAS?"), "who owns GAS?");
+    });
+  }
+});
+
+Deno.test("formatQueryForEmbedding — falls back to the default model when unset", () => {
+  // getLlmConfig defaults to text-embedding-3-small, which must NOT be prefixed.
+  withEnv({ LLM_EMBEDDING_MODEL: undefined, LLM_QUERY_INSTRUCTION: undefined }, () => {
+    assertEquals(formatQueryForEmbedding("q"), "q");
+  });
+});
+
+Deno.test("formatQueryForEmbedding — LLM_QUERY_INSTRUCTION overrides the default text", () => {
+  withEnv({ LLM_EMBEDDING_MODEL: "qwen3-embedding:8b", LLM_QUERY_INSTRUCTION: "Custom task" }, () => {
+    const out = formatQueryForEmbedding("q");
+    assertStringIncludes(out, "Instruct: Custom task");
+    assertEquals(out.includes(DEFAULT_QUERY_INSTRUCTION), false);
+  });
+});
+
+Deno.test("formatQueryForEmbedding — empty LLM_QUERY_INSTRUCTION disables prefixing", () => {
+  // The escape hatch: measurement showed one natural-language query got WORSE
+  // with the prefix, so turning it off must be possible without changing model.
+  for (const off of ["", "   "]) {
+    withEnv({ LLM_EMBEDDING_MODEL: "qwen3-embedding:8b", LLM_QUERY_INSTRUCTION: off }, () => {
+      assertEquals(formatQueryForEmbedding("q"), "q");
+    });
+  }
+});
+
+Deno.test("formatQueryForEmbedding — an explicit instruction applies even to other models", () => {
+  // Opting in deliberately should work; the model gate is a default, not a veto.
+  withEnv({ LLM_EMBEDDING_MODEL: "some-other-model", LLM_QUERY_INSTRUCTION: "Task" }, () => {
+    assertStringIncludes(formatQueryForEmbedding("q"), "Instruct: Task");
+  });
 });
