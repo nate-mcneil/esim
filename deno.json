@@ -2,7 +2,8 @@
   "tasks": {
     "start": "deno run --allow-net --allow-env --allow-read --allow-sys src/main.ts",
     "setup": "deno run --allow-net --allow-env --allow-read --allow-sys src/schema.ts",
-    "test": "deno test src/ --allow-env"
+    "test": "deno test src/ --allow-env",
+    "check": "deno check src/*.ts scripts/*.ts"
   },
   "imports": {
     "neo4j-driver": "npm:neo4j-driver@5",
