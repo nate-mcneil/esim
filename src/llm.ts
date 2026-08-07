@@ -20,6 +20,64 @@ function getApiKey(): string {
   return key;
 }
 
+// ─── Embedding input limits ──────────────────────────────────
+
+/**
+ * Characters of input sent to the embedding model, beyond which text is cut.
+ *
+ * Long inputs are a real operational failure, not a theoretical one. On
+ * 2026-08-06 a local qwen3-embedding:8b runner CRASHED (the server returned
+ * `EOF` from the model process, not a clean 4xx) on node content above roughly
+ * 9,000 characters of prose, which blocked every write that regenerates an
+ * embedding. The threshold drifted between runs with memory pressure, so a cap
+ * hugging it is not safe; this default sits well below.
+ *
+ * The true constraint is TOKENS (~2,300 for that runner), and characters are a
+ * proxy: ~3.5-4 chars/token for English prose, less for text dense in
+ * punctuation, URLs and snake_case identifiers. 6,000 chars is ~1,700 tokens
+ * even on pessimistic tokenization.
+ *
+ * Override with LLM_EMBEDDING_MAX_CHARS when the configured model has a
+ * different practical ceiling (hosted APIs are generally far more generous;
+ * OpenAI's text-embedding-3-small accepts ~8,191 tokens and rejects overlong
+ * input cleanly rather than dying).
+ */
+export const DEFAULT_EMBEDDING_MAX_CHARS = 6000;
+
+function embeddingMaxChars(): number {
+  const raw = Deno.env.get("LLM_EMBEDDING_MAX_CHARS");
+  const parsed = raw ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_EMBEDDING_MAX_CHARS;
+}
+
+/**
+ * Cuts text to a length the embedding model can handle.
+ *
+ * TRADEOFF, deliberate: the tail of an over-long document does not contribute
+ * to its vector, so a node whose distinguishing detail sits only in its last
+ * paragraph becomes harder to retrieve. That is accepted because the
+ * alternative on a crashing runner is no embedding at all. If tail content
+ * starts mattering, the upgrade is chunk-and-mean-pool rather than a bigger
+ * cap, since raising the cap just walks back toward the crash.
+ *
+ * Cuts at a paragraph break when one is reasonably near the limit, else a word
+ * boundary, so the input does not end mid-token.
+ */
+export function truncateForEmbedding(
+  text: string,
+  maxChars: number = embeddingMaxChars(),
+): string {
+  if (text.length <= maxChars) return text;
+
+  const slice = text.slice(0, maxChars);
+  // Prefer a paragraph break, but only if it keeps most of the budget.
+  const paragraph = slice.lastIndexOf("\n\n");
+  if (paragraph > maxChars * 0.8) return slice.slice(0, paragraph);
+  // Otherwise fall back to the last whitespace so we never cut mid-word.
+  const space = slice.search(/\s\S*$/);
+  return space > 0 ? slice.slice(0, space) : slice;
+}
+
 // ─── Embedding Cache ────────────────────────────────────────
 
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -53,7 +111,12 @@ function setCachedEmbedding(text: string, embedding: number[]): void {
 // ─── Embeddings ───────────────────────────────────────────────
 
 export async function getEmbedding(text: string): Promise<number[]> {
-  const cached = getCachedEmbedding(text);
+  // Truncate BEFORE the cache lookup so the key matches what was actually
+  // embedded. Two long texts sharing a prefix collapse to one entry, which is
+  // correct: with only the prefix sent, their vectors would be identical.
+  const input = truncateForEmbedding(text);
+
+  const cached = getCachedEmbedding(input);
   if (cached) return cached;
 
   const config = getLlmConfig();
@@ -65,7 +128,7 @@ export async function getEmbedding(text: string): Promise<number[]> {
     },
     body: JSON.stringify({
       model: config.embeddingModel,
-      input: text,
+      input,
     }),
   });
 
@@ -77,7 +140,7 @@ export async function getEmbedding(text: string): Promise<number[]> {
 
   const data = await res.json();
   const embedding = data.data[0].embedding;
-  setCachedEmbedding(text, embedding);
+  setCachedEmbedding(input, embedding);
   return embedding;
 }
 
@@ -85,15 +148,20 @@ export async function getEmbeddings(texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
   if (texts.length === 1) return [await getEmbedding(texts[0])];
 
+  // Same truncation as the single path, applied up front. A batch is only as
+  // safe as its longest member: one over-long entry kills the whole request,
+  // and on a crashing runner it takes the fallback retries down with it.
+  const inputs = texts.map((t) => truncateForEmbedding(t));
+
   // Check cache, only send uncached to API
-  const results: (number[] | null)[] = texts.map((t) => getCachedEmbedding(t));
+  const results: (number[] | null)[] = inputs.map((t) => getCachedEmbedding(t));
   const uncachedIndices = results
     .map((r, i) => (r === null ? i : -1))
     .filter((i) => i >= 0);
 
   if (uncachedIndices.length === 0) return results as number[][];
 
-  const uncachedTexts = uncachedIndices.map((i) => texts[i]);
+  const uncachedTexts = uncachedIndices.map((i) => inputs[i]);
   const config = getLlmConfig();
 
   try {
